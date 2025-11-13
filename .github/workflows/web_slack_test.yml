@@ -1,55 +1,112 @@
-name: '[Ondemand] Test Web Slack Notification'
-run-name: '[${{ inputs.environment }}] Web Slack Test'
+name: Slack Notification Test
 
 on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Environment'
+        description: 'Environment to deploy'
         required: true
-        default: 'dev.zentium.ai'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+        default: 'staging'
 
 jobs:
-  build:
+  notify:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/web
-
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # important for git log comparison
 
-      # 🔥 Step 1: Extract last 5 commit messages
-      - name: Get Deployment Info
-        id: info
+      # STEP 1: OLD & NEW SHA GET KARO (YOU ALREADY USE YOUR OWN SOURCE)
+      - name: Get old and new SHA
+        id: sha
         run: |
-          COMMITS=$(git log -5 --pretty=format:"• %s")
-          echo "COMMITS<<EOF" >> $GITHUB_OUTPUT
-          echo "$COMMITS" >> $GITHUB_OUTPUT
+          # OLD SHA: Directly from last successful run (example)
+          # You can replace this with your own stored SHA
+          OLD_SHA=$(git rev-parse HEAD~5)
+
+          # NEW SHA: always HEAD
+          NEW_SHA=$(git rev-parse HEAD)
+
+          echo "old_sha=$OLD_SHA" >> $GITHUB_OUTPUT
+          echo "new_sha=$NEW_SHA" >> $GITHUB_OUTPUT
+        shell: bash
+
+      # STEP 2: RECENT COMMITS MD FILE GENERATE
+      - name: Generate recent commits markdown
+        run: |
+          git log ${{ steps.sha.outputs.old_sha }}..${{ steps.sha.outputs.new_sha }} \
+            --pretty=format:"* %s (%an)" > recent_commits.md
+        shell: bash
+
+      # STEP 3: READ MD FILE SAFE OUTPUT
+      - name: Read recent commit MD file
+        id: mdfile
+        run: |
+          CONTENT=$(cat recent_commits.md)
+          CONTENT="${CONTENT//'%'/'%25'}"
+          CONTENT="${CONTENT//$'\n'/'%0A'}"
+          CONTENT="${CONTENT//$'\r'/'%0D'}"
+          echo "commits=$CONTENT" >> $GITHUB_OUTPUT
+        shell: bash
+
+      # 🔽 YOUR EXISTING CODE STARTS HERE 🔽
+
+      - name: Fetch Latest Merged PR
+        id: fetch-pr
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          PR_NUMBER=$(gh pr list --head="$BRANCH" --state=merged --limit=1 --json number -q '.[0].number' || echo "0")
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Extract PR Details & Type
+        id: pr-details
+        if: steps.fetch-pr.outputs.pr_number != '0'
+        run: |
+          PR_NUMBER="${{ steps.fetch-pr.outputs.pr_number }}"
+          TITLE=$(gh pr view "$PR_NUMBER" --json title -q '.title')
+          BODY=$(gh pr view "$PR_NUMBER" --json body -q '.body // empty')
+          BODY_SNIPPET=$(echo "$BODY" | head -c 200)
+          if [[ $TITLE == *"feat:"* ]]; then
+            TYPE="Feat"
+          elif [[ $TITLE == *"fix:"* ]]; then
+            TYPE="Fix"
+          else
+            TYPE="Other"
+          fi
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+          echo "body_snippet<<EOF" >> $GITHUB_OUTPUT
+          echo "$BODY_SNIPPET" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+          echo "type=$TYPE" >> $GITHUB_OUTPUT
+        shell: bash
 
-      # 🔥 Step 2: Send Slack Notification (Success)
+      # STEP 4: SEND BOTH PR INFO + COMMIT DIFF → SLACK
       - name: Notify Slack - Success
-        if: success()
+        if: always()
         env:
           TARGET_ENVIRONMENT: ${{ inputs.environment }}
         run: |
-          DATE=$(date '+%d-%b-%Y %H:%M:%S')
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{
-            \"text\": \"*Web App Deployment Successful!*\n\n*Environment:* ${TARGET_ENVIRONMENT}\n\n*Changes:*\n${{ steps.info.outputs.COMMITS }}\n\nDeployed at: ${DATE}\"
-          }" \
-          ${{ secrets.SLACK_WEBHOOK_URL }}
+          DEPLOYMENT_DATE=$(date '+%d-%b-%Y %H:%M:%S')
 
-      # 🔥 Step 3: Slack Notification (Failure)
-      - name: Notify Slack - Failure
-        if: failure()
-        env:
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
-        run: |
-          DATE=$(date '+%d-%b-%Y %H:%M:%S')
+          if [ "${{ steps.fetch-pr.outputs.pr_number }}" != "0" ]; then
+            PR_TITLE="${{ steps.pr-details.outputs.title }}"
+            PR_TYPE="${{ steps.pr-details.outputs.type }}"
+            PR_SNIPPET="${{ steps.pr-details.outputs.body_snippet }}"
+            PR_LINK="<${{ github.server_url }}/${{ github.repository }}/pull/${{ steps.fetch-pr.outputs.pr_number }}|View PR #${{ steps.fetch-pr.outputs.pr_number }}>"
+          else
+            PR_TITLE="No Recent PR"
+            PR_TYPE="N/A"
+            PR_SNIPPET="Direct test deploy"
+            PR_LINK="N/A"
+          fi
           curl -X POST -H 'Content-type: application/json' \
           --data "{
-            \"text\": \"*Web App Deployment Failed!*\n\n*Environment:* ${TARGET_ENVIRONMENT}\n\n*Check Logs in GitHub Actions.*\nFailed at: ${DATE}\"
+            \"text\": \"*Deployment Successful!*\n\n*Environment:* $TARGET_ENVIRONMENT\n*Branch:* ${{ github.ref_name }}\n\n*PR Title:* $PR_TITLE\n*Type:* $PR_TYPE\n*PR Description (Snippet):*\n\`\`\`\n$PR_SNIPPET\n\`\`\`\n$PR_LINK\n\n*Recent Commits (Auto-detected):*\n\`\`\`\n${{ steps.mdfile.outputs.commits }}\n\`\`\`\nDeployed at: $DEPLOYMENT_DATE\nGitHub Actions: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>\"
           }" \
           ${{ secrets.SLACK_WEBHOOK_URL }}
