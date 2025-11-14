@@ -4,7 +4,7 @@ on:
     types: [opened, synchronize, closed]
     branches: [dev]
   push:
-    branches: [stage, prod]
+    branches: [stage, prod, main]  # Added main for dispatch testing
   workflow_dispatch:
 
 jobs:
@@ -13,75 +13,86 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # Needed for git/changelog
 
-      # Extract PR info
+      # Step 1: Extract PR Info (only if PR event)
       - name: Extract PR Info
         if: github.event_name == 'pull_request'
         id: pr-info
         run: |
           echo "title<<EOF" >> $GITHUB_OUTPUT
-          echo "${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
+          echo "${{ github.event.pull_request.title || 'Untitled PR' }}" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
           echo "desc<<EOF" >> $GITHUB_OUTPUT
           echo "${{ github.event.pull_request.body || 'No description provided.' }}" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
-          echo "state=${{ github.event.pull_request.state }}" >> $GITHUB_OUTPUT
-          echo "merged=${{ github.event.pull_request.merged }}" >> $GITHUB_OUTPUT
+          echo "state=${{ github.event.pull_request.state || 'open' }}" >> $GITHUB_OUTPUT
+          echo "merged=${{ fromJson(github.event.pull_request.merged) || false }}" >> $GITHUB_OUTPUT
           echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
 
-      # Extract Changelog
+      # Step 2: Extract Changelog (for push/dispatch)
       - name: Extract Changelog
         if: github.event_name != 'pull_request'
         id: changelog
         run: |
+          BRANCH="${{ github.ref_name }}"
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
           if [ ! -f CHANGELOG.md ]; then
             echo "changelog<<EOF" >> $GITHUB_OUTPUT
-            echo "* No CHANGELOG.md found. Add one for deployment details!" >> $GITHUB_OUTPUT
+            echo "* No CHANGELOG.md found. Add one for better deployment details!" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
-          else
-            # Parse latest unreleased section (improved awk for bullets)
-            LATEST=$(awk '
-              /^## \[[Uu]nreleased[^]]*\] - / { in_section=1; next }
-              in_section && /^### / { gsub(/^### /, "• "); print; next }
-              in_section && /^## / { in_section=0 }
-              in_section { print "• " $0 }
-            ' CHANGELOG.md | head -20)
-            if [ -z "$LATEST" ]; then LATEST="* No recent changes listed."; fi
-            echo "changelog<<EOF" >> $GITHUB_OUTPUT
-            echo "$LATEST" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
+            exit 0
           fi
-          echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
+          # Parse latest [Unreleased] section - bullet format
+          LATEST=$(awk '
+            tolower($0) ~ /^## \\[[u]nreleased/ { in_sec=1; next }
+            in_sec && /^### / { gsub(/^### /, "• "); print; next }
+            in_sec && /^## / { in_sec=0; exit }
+            in_sec && $0 ~ /^[ \t]*-/ { print "• " substr($0, 2) }  # Bullet if -
+            in_sec && $0 ~ /^[ \t]*[*]/ { print "• " substr($0, 2) }  # Bullet if *
+          ' CHANGELOG.md | head -15 | sed 's/^[ \t]*//')
+          if [ -z "$LATEST" ]; then
+            LATEST="* No recent changes in [Unreleased] section."
+          fi
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$LATEST" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
-      # Send to Slack (fixed script)
+      # Step 3: Send Slack (NO HEREDOC - simple strings)
       - name: Send to Slack
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-          DATE: $(date '+%d-%b-%Y %H:%M:%S')
           EVENT_NAME: ${{ github.event_name }}
+          DATE: ${{ github.event_name == 'workflow_dispatch' && format('{0,date,dd-MMM-yyyy HH:mm:ss}', now()) || format('{0,date,dd-MMM-yyyy HH:mm:ss}', now()) }}  # GitHub expr for date
           PR_TITLE: ${{ steps.pr-info.outputs.title || '' }}
           PR_DESC: ${{ steps.pr-info.outputs.desc || '' }}
           PR_STATE: ${{ steps.pr-info.outputs.state || '' }}
           PR_MERGED: ${{ steps.pr-info.outputs.merged || 'false' }}
           BRANCH: ${{ steps.changelog.outputs.branch || github.ref_name }}
           RUN_URL: ${{ steps.pr-info.outputs.run_url || steps.changelog.outputs.run_url }}
-          CHANGELOG: ${{ steps.changelog.outputs.changelog || '' }}
+          CHANGELOG: ${{ steps.changelog.outputs.changelog || '* Testing changelog extraction.' }}
         run: |
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            STATE="New PR"
+            # PR Logic - Simple string build
             if [ "$PR_STATE" = "closed" ] && [ "$PR_MERGED" = "true" ]; then
               STATE="Merged PR"
+            else
+              STATE="New PR"
             fi
-            TEXT="*${STATE} on Dev!*\n\n*Title:* $PR_TITLE\n*Description:* $PR_DESC\n\n*Branch:* dev\n*Triggered at:* $DATE\n<$RUN_URL|GitHub Actions: View Run>"
+            # Escape for JSON (basic: replace " with \")
+            TITLE_ESC=$(echo "$PR_TITLE" | sed 's/"/\\"/g')
+            DESC_ESC=$(echo "$PR_DESC" | sed 's/"/\\"/g')
+            TEXT="*${STATE} on Dev!*\n\n*Title:* ${TITLE_ESC}\n*Description:* ${DESC_ESC}\n\n*Branch:* dev\n*Triggered at:* $DATE\n<${RUN_URL}|GitHub Actions: View Run>"
             curl -X POST -H 'Content-type: application/json' \
-              --data "{\"text\": \"$TEXT\"}" \
+              --data "{\"text\": \"${TEXT}\"}" \
               "$SLACK_WEBHOOK"
           else
+            # Push/Deploy Logic
             ENV=$(echo "$BRANCH" | tr '[:lower:]' '[:upper:]')
-            TEXT="*Test Deployment Notification*\n\n*Branch:* $BRANCH\n*Changes:*\n$CHANGELOG\n\n*Environment:* $ENV\n*Triggered at:* $DATE\n<$RUN_URL|GitHub Actions: View Run>"
+            CHANGELOG_ESC=$(echo "$CHANGELOG" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')  # Escape newlines for JSON
+            TEXT="*Test Deployment Notification*\n\n*Branch:* $BRANCH\n*Changes:*\n${CHANGELOG}\n\n*Environment:* $ENV\n*Triggered at:* $DATE\n<${RUN_URL}|GitHub Actions: View Run>"
             curl -X POST -H 'Content-type: application/json' \
-              --data "{\"text\": \"$TEXT\"}" \
+              --data "{\"text\": \"${TEXT}\"}" \
               "$SLACK_WEBHOOK"
           fi
