@@ -1,6 +1,5 @@
-name: '[Ondemand] Test Web Slack Notification'
-run-name: '[${{ inputs.environment }}] Web Slack Test'
-
+name: 'Slack Notifications'
+run-name: '[${{ inputs.environment || github.ref_name }}] Web Slack Test'
 on:
   workflow_dispatch:
     inputs:
@@ -8,19 +7,43 @@ on:
         description: 'Environment'
         required: true
         default: 'dev.zentium.ai'
+  pull_request:
+    types: [opened, synchronize, closed]  # PR raised/updated/merged
+    branches: [dev]
+  push:
+    branches: [stage, prod]
 
 jobs:
-  build:
+  notify:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: apps/web
-
+        working-directory: apps/web  # Remove if not needed; assume dir exists
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v4  # Updated to v4 for better fetch
+        with:
+          fetch-depth: 0  # For git log/changelog
 
-      # 🔥 Step 1: Extract last 5 commit messages
+      # Step 1: Extract PR Info (for PR events)
+      - name: Extract PR Info
+        if: github.event_name == 'pull_request'
+        id: pr-info
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "title<<EOF" >> $GITHUB_OUTPUT
+          echo "${{ github.event.pull_request.title || 'Untitled PR' }}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "desc<<EOF" >> $GITHUB_OUTPUT
+          echo "${{ github.event.pull_request.body || 'No description provided.' }}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "state=${{ github.event.pull_request.state }}" >> $GITHUB_OUTPUT
+          echo "merged=${{ github.event.pull_request.merged }}" >> $GITHUB_OUTPUT
+          echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
+
+      # Step 1 Alt: Extract Commits (for manual/dispatch fallback)
       - name: Get Deployment Info
+        if: github.event_name == 'workflow_dispatch'
         id: info
         run: |
           COMMITS=$(git log -5 --pretty=format:"• %s")
@@ -28,28 +51,63 @@ jobs:
           echo "$COMMITS" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      # 🔥 Step 2: Send Slack Notification (Success)
+      # Step 2: Extract Changelog (for stage/prod push)
+      - name: Extract Changelog
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/stage' || github.ref == 'refs/heads/prod')
+        id: changelog
+        run: |
+          if [ ! -f ../../CHANGELOG.md ]; then  # Relative to apps/web
+            echo "changes<<EOF" >> $GITHUB_OUTPUT
+            echo "* No CHANGELOG.md found in root." >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            LATEST=$(awk '
+              tolower($0) ~ /^## \\[[u]nreleased/ { in_sec=1; next }
+              in_sec && /^### / { gsub(/^### /, "• "); print; next }
+              in_sec && /^## / { in_sec=0 }
+              in_sec { print "• " $0 }
+            ' ../../CHANGELOG.md | head -15)
+            if [ -z "$LATEST" ]; then LATEST="* No unreleased changes."; fi
+            echo "changes<<EOF" >> $GITHUB_OUTPUT
+            echo "$LATEST" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          echo "env=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+
+      # Step 3: Send Slack Success Notification
       - name: Notify Slack - Success
         if: success()
         env:
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment || github.ref_name || 'dev.zentium.ai' }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DATE: $(date '+%d-%b-%Y %H:%M:%S')
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          DATE=$(date '+%d-%b-%Y %H:%M:%S')
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{
-            \"text\": \"*Web App Deployment Successful!*\n\n*Environment:* ${TARGET_ENVIRONMENT}\n\n*Changes:*\n${{ steps.info.outputs.COMMITS }}\n\nDeployed at: ${DATE}\"
-          }" \
-          ${{ secrets.SLACK_WEBHOOK_URL }}
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            STATE="New PR"
+            if [ "${{ steps.pr-info.outputs.state }}" = "closed" ] && [ "${{ steps.pr-info.outputs.merged }}" = "true" ]; then
+              STATE="Merged PR"
+            fi
+            TITLE="${{ steps.pr-info.outputs.title }}"
+            DESC="${{ steps.pr-info.outputs.desc }}"
+            TEXT="*${STATE} on Dev!*\n\n*Title:* $TITLE\n*Description:* $DESC\n\n*Environment:* $TARGET_ENVIRONMENT\n*Triggered at:* $DATE\n<$RUN_URL|View Run>"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            CHANGES="${{ steps.changelog.outputs.changes || 'No changes extracted.' }}"
+            TEXT="*Web App Deployment Successful!*\n\n*Environment:* $TARGET_ENVIRONMENT\n\n*Changes:*\n$CHANGES\n\nDeployed at: $DATE\n<$RUN_URL|View Run>"
+          else  # workflow_dispatch fallback
+            COMMITS="${{ steps.info.outputs.COMMITS || 'No commits.' }}"
+            TEXT="*Web App Deployment Successful!*\n\n*Environment:* $TARGET_ENVIRONMENT\n\n*Changes:*\n$COMMITS\n\nDeployed at: $DATE\n<$RUN_URL|View Run>"
+          fi
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\": \"$TEXT\"}" "$SLACK_WEBHOOK"
 
-      # 🔥 Step 3: Slack Notification (Failure)
+      # Step 4: Send Slack Failure Notification
       - name: Notify Slack - Failure
         if: failure()
         env:
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment || github.ref_name || 'dev.zentium.ai' }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DATE: $(date '+%d-%b-%Y %H:%M:%S')
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          DATE=$(date '+%d-%b-%Y %H:%M:%S')
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{
-            \"text\": \"*Web App Deployment Failed!*\n\n*Environment:* ${TARGET_ENVIRONMENT}\n\n*Check Logs in GitHub Actions.*\nFailed at: ${DATE}\"
-          }" \
-          ${{ secrets.SLACK_WEBHOOK_URL }}
+          TEXT="*Web App Deployment Failed!*\n\n*Environment:* $TARGET_ENVIRONMENT\n\n*Check Logs in GitHub Actions.*\nFailed at: $DATE\n<$RUN_URL|View Run>"
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\": \"$TEXT\"}" "$SLACK_WEBHOOK"
