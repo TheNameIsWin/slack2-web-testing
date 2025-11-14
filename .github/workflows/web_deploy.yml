@@ -1,11 +1,11 @@
 name: 'Slack Notifications'
 on:
   pull_request:
-    types: [opened, synchronize, closed]  # Raised, updated, merged
-    branches: [dev]  # Only for dev branch PRs
+    types: [opened, synchronize, closed]
+    branches: [dev]
   push:
-    branches: [stage, prod]  # Merges to stage/prod
-  workflow_dispatch:  # Manual test trigger
+    branches: [stage, prod]
+  workflow_dispatch:
 
 jobs:
   notify:
@@ -13,40 +13,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # For git log/changelog
+          fetch-depth: 0
 
-      # Extract PR info (for dev PRs)
+      # Extract PR info
       - name: Extract PR Info
         if: github.event_name == 'pull_request'
         id: pr-info
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_DESC="${{ github.event.pull_request.body || 'No description' }}"
-          PR_STATE="${{ github.event.pull_request.state }}"
           echo "title<<EOF" >> $GITHUB_OUTPUT
-          echo "$PR_TITLE" >> $GITHUB_OUTPUT
+          echo "${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
           echo "desc<<EOF" >> $GITHUB_OUTPUT
-          echo "$PR_DESC" >> $GITHUB_OUTPUT
+          echo "${{ github.event.pull_request.body || 'No description provided.' }}" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
-          echo "state=$PR_STATE" >> $GITHUB_OUTPUT
+          echo "state=${{ github.event.pull_request.state }}" >> $GITHUB_OUTPUT
+          echo "merged=${{ github.event.pull_request.merged }}" >> $GITHUB_OUTPUT
           echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
 
-      # Extract Changelog (for stage/prod pushes)
+      # Extract Changelog
       - name: Extract Changelog
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request'
         id: changelog
         run: |
           if [ ! -f CHANGELOG.md ]; then
             echo "changelog<<EOF" >> $GITHUB_OUTPUT
-            echo "* No CHANGELOG.md found. Add one for deployment details." >> $GITHUB_OUTPUT
+            echo "* No CHANGELOG.md found. Add one for deployment details!" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
           else
-            # Get latest unreleased section (first ## [Unreleased] or similar)
-            LATEST=$(awk '/^## \[[^]]+\] - / {found=1; next} found && /^###/ {sub(/^### /, "• "); print; next} found && /^\s*$/ {found=0}' CHANGELOG.md | head -10)
-            if [ -z "$LATEST" ]; then LATEST="* No recent changes in CHANGELOG.md"; fi
+            # Parse latest unreleased section (improved awk for bullets)
+            LATEST=$(awk '
+              /^## \[[Uu]nreleased[^]]*\] - / { in_section=1; next }
+              in_section && /^### / { gsub(/^### /, "• "); print; next }
+              in_section && /^## / { in_section=0 }
+              in_section { print "• " $0 }
+            ' CHANGELOG.md | head -20)
+            if [ -z "$LATEST" ]; then LATEST="* No recent changes listed."; fi
             echo "changelog<<EOF" >> $GITHUB_OUTPUT
             echo "$LATEST" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
@@ -54,30 +55,33 @@ jobs:
           echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
 
-      # Send Slack Notification
+      # Send to Slack (fixed script)
       - name: Send to Slack
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
           DATE: $(date '+%d-%b-%Y %H:%M:%S')
+          EVENT_NAME: ${{ github.event_name }}
+          PR_TITLE: ${{ steps.pr-info.outputs.title || '' }}
+          PR_DESC: ${{ steps.pr-info.outputs.desc || '' }}
+          PR_STATE: ${{ steps.pr-info.outputs.state || '' }}
+          PR_MERGED: ${{ steps.pr-info.outputs.merged || 'false' }}
+          BRANCH: ${{ steps.changelog.outputs.branch || github.ref_name }}
+          RUN_URL: ${{ steps.pr-info.outputs.run_url || steps.changelog.outputs.run_url }}
+          CHANGELOG: ${{ steps.changelog.outputs.changelog || '' }}
         run: |
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            STATE="New"  # Default for opened/synchronize
-            if [ "${{ steps.pr-info.outputs.state }}" == "closed" ] && [ "${{ github.event.pull_request.merged }}" == "true" ]; then
-              STATE="Merged"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            STATE="New PR"
+            if [ "$PR_STATE" = "closed" ] && [ "$PR_MERGED" = "true" ]; then
+              STATE="Merged PR"
             fi
-            PAYLOAD=$(cat <<EOF
-            {
-              "text": "*${STATE} PR on Dev!*\n\n*Title:* ${{ steps.pr-info.outputs.title }}\n*Description:* ${{ steps.pr-info.outputs.desc }}\n\n*Branch:* dev\n*Triggered at:* ${DATE}\n<${{ steps.pr-info.outputs.run_url }}|GitHub Actions: View Run>"
-            }
-            EOF
-            )
-          else  # push to stage/prod
-            ENV=$(echo ${{ github.ref_name }} | tr '[:lower:]' '[:upper:]')
-            PAYLOAD=$(cat <<EOF
-            {
-              "text": "*Test Deployment Notification*\n\n*Branch:* ${{ github.ref_name }}\n*Changes:*\n${{ steps.changelog.outputs.changelog }}\n\n*Environment:* ${ENV}\n*Triggered at:* ${DATE}\n<${{ steps.changelog.outputs.run_url }}|GitHub Actions: View Run>"
-            }
-            EOF
-            )
+            TEXT="*${STATE} on Dev!*\n\n*Title:* $PR_TITLE\n*Description:* $PR_DESC\n\n*Branch:* dev\n*Triggered at:* $DATE\n<$RUN_URL|GitHub Actions: View Run>"
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{\"text\": \"$TEXT\"}" \
+              "$SLACK_WEBHOOK"
+          else
+            ENV=$(echo "$BRANCH" | tr '[:lower:]' '[:upper:]')
+            TEXT="*Test Deployment Notification*\n\n*Branch:* $BRANCH\n*Changes:*\n$CHANGELOG\n\n*Environment:* $ENV\n*Triggered at:* $DATE\n<$RUN_URL|GitHub Actions: View Run>"
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{\"text\": \"$TEXT\"}" \
+              "$SLACK_WEBHOOK"
           fi
-          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" $SLACK_WEBHOOK
