@@ -1,148 +1,88 @@
-name: Slack Notification Test
+name: "Slack Deployment Test"
+run-name: "Slack Test - [${{ github.ref_name }}]"
 
 on:
+  push:
+    branches:
+      - main
+      - develop
+      - staging
   workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Environment to deploy'
-        required: true
-        type: choice
-        options:
-          - dev
-          - staging
-          - production
-        default: 'staging'
 
 jobs:
-  notify:
+  slack-test:
     runs-on: ubuntu-latest
 
     steps:
-
-      # ---------------------------------------------------
-      # Checkout full history (IMPORTANT for git log)
-      # ---------------------------------------------------
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ---------------------------------------------------
-      # STEP 1: SAFE OLD & NEW SHA DETECTION
-      # ---------------------------------------------------
-      - name: Get old and new SHA (SAFE VERSION)
-        id: sha
-        run: |
-          TOTAL=$(git rev-list --count HEAD)
-
-          # If there are more than 1 commits → use previous commit
-          if [ "$TOTAL" -gt 1 ]; then
-            OLD_SHA=$(git rev-parse HEAD~1)
-          else
-            # Only one commit exists → prevent error
-            OLD_SHA=$(git rev-parse HEAD)
-          fi
-
-          NEW_SHA=$(git rev-parse HEAD)
-
-          echo "old_sha=$OLD_SHA" >> $GITHUB_OUTPUT
-          echo "new_sha=$NEW_SHA" >> $GITHUB_OUTPUT
-          shell: bash
-
-
-      # ---------------------------------------------------
-      # STEP 2: Generate markdown containing recent commits
-      # ---------------------------------------------------
-      - name: Generate recent commits markdown
-        run: |
-          git log ${{ steps.sha.outputs.old_sha }}..${{ steps.sha.outputs.new_sha }} \
-            --pretty=format:"* %s (%an)" > recent_commits.md
-        shell: bash
-
-      # ---------------------------------------------------
-      # STEP 3: Read markdown file and escape it for Slack
-      # ---------------------------------------------------
-      - name: Read recent commit MD file (safe output)
-        id: mdfile
-        run: |
-          CONTENT=$(cat recent_commits.md)
-          CONTENT="${CONTENT//'%'/'%25'}"
-          CONTENT="${CONTENT//$'\n'/'%0A'}"
-          CONTENT="${CONTENT//$'\r'/'%0D'}"
-          echo "commits=$CONTENT" >> $GITHUB_OUTPUT
-        shell: bash
-
-      # ---------------------------------------------------
-      # STEP 4: Fetch merged PR (if any)
-      # ---------------------------------------------------
-      - name: Fetch Latest Merged PR
-        id: fetch-pr
-        run: |
-          BRANCH="${{ github.ref_name }}"
-          PR_NUMBER=$(gh pr list --head="$BRANCH" --state=merged --limit=1 --json number -q '.[0].number' || echo "0")
-          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
-        shell: bash
-
-      # ---------------------------------------------------
-      # STEP 5: Extract PR details (type/title/body)
-      # ---------------------------------------------------
-      - name: Extract PR Details & Type
-        id: pr-details
-        if: steps.fetch-pr.outputs.pr_number != '0'
-        run: |
-          PR_NUMBER="${{ steps.fetch-pr.outputs.pr_number }}"
-          TITLE=$(gh pr view "$PR_NUMBER" --json title -q '.title')
-          BODY=$(gh pr view "$PR_NUMBER" --json body -q '.body // empty')
-          BODY_SNIPPET=$(echo "$BODY" | head -c 200)
-
-          # TypeDetection
-          if [[ $TITLE == *"feat:"* ]]; then
-            TYPE="Feat"
-          elif [[ $TITLE == *"fix:"* ]]; then
-            TYPE="Fix"
-          else
-            TYPE="Other"
-          fi
-
-          echo "title=$TITLE" >> $GITHUB_OUTPUT
-          echo "body_snippet<<EOF" >> $GITHUB_OUTPUT
-          echo "$BODY_SNIPPET" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          echo "type=$TYPE" >> $GITHUB_OUTPUT
-        shell: bash
-
-      # ---------------------------------------------------
-      # STEP 6: SLACK NOTIFICATION (PR INFO + COMMITS)
-      # ---------------------------------------------------
-      - name: Notify Slack - Success
-        if: always()
+      - name: Extract Deployment Info
+        id: deployment-info
         env:
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          DEPLOYMENT_DATE=$(date '+%d-%b-%Y %H:%M:%S')
+          git fetch --all --tags --prune
+          CURRENT_BRANCH="${{ github.ref_name }}"
+          DEPLOYMENT_INFO=""
 
-          if [ "${{ steps.fetch-pr.outputs.pr_number }}" != "0" ]; then
-            PR_TITLE="${{ steps.pr-details.outputs.title }}"
-            PR_TYPE="${{ steps.pr-details.outputs.type }}"
-            PR_SNIPPET="${{ steps.pr-details.outputs.body_snippet }}"
-            PR_LINK="<${{ github.server_url }}/${{ github.repository }}/pull/${{ steps.fetch-pr.outputs.pr_number }}|View PR #${{ steps.fetch-pr.outputs.pr_number }}>"
-          else
-            PR_TITLE="No Recent PR"
-            PR_TYPE="N/A"
-            PR_SNIPPET="Direct Deployment (No PR merged)"
-            PR_LINK="N/A"
+          if [ "$CURRENT_BRANCH" = "develop" ]; then
+            MERGE_COMMIT=$(git log -1 --pretty=%B)
+
+            if echo "$MERGE_COMMIT" | grep -q "Merge pull request"; then
+              PR_NUM=$(echo "$MERGE_COMMIT" | grep -o "Merge pull request #[0-9]*" | grep -o "[0-9]*")
+
+              if [ -n "$PR_NUM" ]; then
+                PR_TITLE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                  "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM" \
+                  | jq -r '.title // empty')
+
+                [ -n "$PR_TITLE" ] && DEPLOYMENT_INFO="PR #$PR_NUM: $PR_TITLE"
+              fi
+            fi
           fi
 
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{
-            \"text\": \"🚀 *Deployment Successful!*\n\n
-            *Environment:* $TARGET_ENVIRONMENT\n
-            *Branch:* ${{ github.ref_name }}\n\n
-            *PR Title:* $PR_TITLE\n
-            *Type:* $PR_TYPE\n
-            *PR Description:*\n\`\`\`\n$PR_SNIPPET\n\`\`\`\n
-            $PR_LINK\n\n
-            *Recent Commits:*\n\`\`\`\n${{ steps.mdfile.outputs.commits }}\n\`\`\`\n
-            *Deployed At:* $DEPLOYMENT_DATE\n
-            GitHub Actions: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>\"
-          }" \
-          ${{ secrets.SLACK_WEBHOOK_URL }}
+          if [ "$CURRENT_BRANCH" = "staging" ]; then
+            if git rev-parse --verify origin/develop >/dev/null 2>&1; then
+              COMMITS=$(git log origin/develop..HEAD --oneline --no-merges -5)
+              [ -z "$COMMITS" ] && COMMITS=$(git log origin/develop --oneline --no-merges -5)
+              DEPLOYMENT_INFO=$(echo "$COMMITS" | sed 's/^/• /')
+            fi
+          fi
+
+          if [ "$CURRENT_BRANCH" = "main" ]; then
+            COMMITS=$(git log --oneline -5)
+            DEPLOYMENT_INFO=$(echo "$COMMITS" | sed 's/^/• /')
+          fi
+
+          if [ -z "$DEPLOYMENT_INFO" ]; then
+            COMMITS=$(git log --oneline -3)
+            DEPLOYMENT_INFO=$(echo "$COMMITS" | sed 's/^/• /')
+          fi
+
+          echo "info<<__END__" >> $GITHUB_OUTPUT
+          echo "$DEPLOYMENT_INFO" >> $GITHUB_OUTPUT
+          echo "__END__" >> $GITHUB_OUTPUT
+
+      - name: Notify Slack
+        env:
+          SLACK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          INFO="${{ steps.deployment-info.outputs.info }}"
+          DATE=$(date '+%d-%b-%Y %H:%M:%S')
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          PAYLOAD=$(jq -n \
+            --arg branch "${{ github.ref_name }}" \
+            --arg info "$INFO" \
+            --arg date "$DATE" \
+            --arg run_url "$RUN_URL" \
+            '{
+              text: "*Test Deployment Notification*\n*Branch:* \($branch)\n*Commit Info:*\n```\n\($info)\n```\nTriggered at: \($date)\nGitHub Actions: <\($run_url)|View Run>"
+            }')
+
+          curl -X POST -H "Content-type:application/json" \
+            --data "$PAYLOAD" \
+            "$SLACK_URL"
