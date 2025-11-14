@@ -1,55 +1,83 @@
-name: '[Ondemand] Test Web Slack Notification'
-run-name: '[${{ inputs.environment }}] Web Slack Test'
-
+name: 'Slack Notifications'
 on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Environment'
-        required: true
-        default: 'dev.zentium.ai'
+  pull_request:
+    types: [opened, synchronize, closed]  # Raised, updated, merged
+    branches: [dev]  # Only for dev branch PRs
+  push:
+    branches: [stage, prod]  # Merges to stage/prod
+  workflow_dispatch:  # Manual test trigger
 
 jobs:
-  build:
+  notify:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/web
-
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # For git log/changelog
 
-      # 🔥 Step 1: Extract last 5 commit messages
-      - name: Get Deployment Info
-        id: info
+      # Extract PR info (for dev PRs)
+      - name: Extract PR Info
+        if: github.event_name == 'pull_request'
+        id: pr-info
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          COMMITS=$(git log -5 --pretty=format:"• %s")
-          echo "COMMITS<<EOF" >> $GITHUB_OUTPUT
-          echo "$COMMITS" >> $GITHUB_OUTPUT
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_DESC="${{ github.event.pull_request.body || 'No description' }}"
+          PR_STATE="${{ github.event.pull_request.state }}"
+          echo "title<<EOF" >> $GITHUB_OUTPUT
+          echo "$PR_TITLE" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+          echo "desc<<EOF" >> $GITHUB_OUTPUT
+          echo "$PR_DESC" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "state=$PR_STATE" >> $GITHUB_OUTPUT
+          echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
 
-      # 🔥 Step 2: Send Slack Notification (Success)
-      - name: Notify Slack - Success
-        if: success()
-        env:
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+      # Extract Changelog (for stage/prod pushes)
+      - name: Extract Changelog
+        if: github.event_name == 'push'
+        id: changelog
         run: |
-          DATE=$(date '+%d-%b-%Y %H:%M:%S')
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{
-            \"text\": \"*Web App Deployment Successful!*\n\n*Environment:* ${TARGET_ENVIRONMENT}\n\n*Changes:*\n${{ steps.info.outputs.COMMITS }}\n\nDeployed at: ${DATE}\"
-          }" \
-          ${{ secrets.SLACK_WEBHOOK_URL }}
+          if [ ! -f CHANGELOG.md ]; then
+            echo "changelog<<EOF" >> $GITHUB_OUTPUT
+            echo "* No CHANGELOG.md found. Add one for deployment details." >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            # Get latest unreleased section (first ## [Unreleased] or similar)
+            LATEST=$(awk '/^## \[[^]]+\] - / {found=1; next} found && /^###/ {sub(/^### /, "• "); print; next} found && /^\s*$/ {found=0}' CHANGELOG.md | head -10)
+            if [ -z "$LATEST" ]; then LATEST="* No recent changes in CHANGELOG.md"; fi
+            echo "changelog<<EOF" >> $GITHUB_OUTPUT
+            echo "$LATEST" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
 
-      # 🔥 Step 3: Slack Notification (Failure)
-      - name: Notify Slack - Failure
-        if: failure()
+      # Send Slack Notification
+      - name: Send to Slack
         env:
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DATE: $(date '+%d-%b-%Y %H:%M:%S')
         run: |
-          DATE=$(date '+%d-%b-%Y %H:%M:%S')
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{
-            \"text\": \"*Web App Deployment Failed!*\n\n*Environment:* ${TARGET_ENVIRONMENT}\n\n*Check Logs in GitHub Actions.*\nFailed at: ${DATE}\"
-          }" \
-          ${{ secrets.SLACK_WEBHOOK_URL }}
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            STATE="New"  # Default for opened/synchronize
+            if [ "${{ steps.pr-info.outputs.state }}" == "closed" ] && [ "${{ github.event.pull_request.merged }}" == "true" ]; then
+              STATE="Merged"
+            fi
+            PAYLOAD=$(cat <<EOF
+            {
+              "text": "*${STATE} PR on Dev!*\n\n*Title:* ${{ steps.pr-info.outputs.title }}\n*Description:* ${{ steps.pr-info.outputs.desc }}\n\n*Branch:* dev\n*Triggered at:* ${DATE}\n<${{ steps.pr-info.outputs.run_url }}|GitHub Actions: View Run>"
+            }
+            EOF
+            )
+          else  # push to stage/prod
+            ENV=$(echo ${{ github.ref_name }} | tr '[:lower:]' '[:upper:]')
+            PAYLOAD=$(cat <<EOF
+            {
+              "text": "*Test Deployment Notification*\n\n*Branch:* ${{ github.ref_name }}\n*Changes:*\n${{ steps.changelog.outputs.changelog }}\n\n*Environment:* ${ENV}\n*Triggered at:* ${DATE}\n<${{ steps.changelog.outputs.run_url }}|GitHub Actions: View Run>"
+            }
+            EOF
+            )
+          fi
+          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" $SLACK_WEBHOOK
