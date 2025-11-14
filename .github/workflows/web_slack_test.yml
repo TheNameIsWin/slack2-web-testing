@@ -1,6 +1,9 @@
 name: "Slack Deployment Compare"
 run-name: "Slack Compare - [${{ github.ref_name }}]"
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
   push:
