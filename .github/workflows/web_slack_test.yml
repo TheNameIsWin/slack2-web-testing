@@ -29,16 +29,16 @@ jobs:
       # ---------------------------------------------------
       # STEP 1: SAFE OLD & NEW SHA DETECTION
       # ---------------------------------------------------
-      - name: Get old and new SHA (Safe)
+      - name: Get old and new SHA (SAFE VERSION)
         id: sha
         run: |
           TOTAL=$(git rev-list --count HEAD)
 
-          # If at least 2 commits exist
+          # If there are more than 1 commits → use previous commit
           if [ "$TOTAL" -gt 1 ]; then
             OLD_SHA=$(git rev-parse HEAD~1)
           else
-            # Only one commit → fallback
+            # Only one commit exists → prevent error
             OLD_SHA=$(git rev-parse HEAD)
           fi
 
@@ -46,7 +46,8 @@ jobs:
 
           echo "old_sha=$OLD_SHA" >> $GITHUB_OUTPUT
           echo "new_sha=$NEW_SHA" >> $GITHUB_OUTPUT
-        shell: bash
+          shell: bash
+
 
       # ---------------------------------------------------
       # STEP 2: Generate markdown containing recent commits
