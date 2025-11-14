@@ -1,5 +1,5 @@
-name: '[Test] Publish Web App to S3 - Slack Notify'
-run-name: '[${{ inputs.environment }}] Test Slack Notification'
+name: 'Combined Slack Notification'
+run-name: '[${{ inputs.environment }}] Test Deployment Notification'
 
 on:
   workflow_dispatch:
@@ -10,34 +10,30 @@ on:
         type: choice
         options:
           - dev.zentium.ai
-          - app.zentium.ai
           - staging.zentium.ai
+          - app.zentium.ai
         default: 'dev.zentium.ai'
 
 jobs:
-  test-notify:
-    name: Test Notification
+  notify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # For git log/API
+          fetch-depth: 0  # For git log/API/changelog
 
-      - name: Extract Deployment Information
-        id: deployment-info
+      # Extract Info (PR for dev, Changelog for stage/prod)
+      - name: Extract Deployment Info
+        id: info
         run: |
-          DEPLOYMENT_INFO=""
+          TARGET_ENV="${{ inputs.environment == 'app.zentium.ai' && 'prod' || inputs.environment == 'staging.zentium.ai' && 'stage' || 'dev' }}"
           CURRENT_BRANCH="${{ github.ref_name }}"
-          TARGET_ENV="${{ inputs.environment == 'app.zentium.ai' && 'production' || inputs.environment == 'staging.zentium.ai' && 'staging' || 'dev' }}"
-          
-          echo "Current Branch: $CURRENT_BRANCH"
-          echo "Target Environment: $TARGET_ENV"
-          
-          # For dev: Simulate PR details (real API if on develop; fake for test)
+          COMMIT_INFO=""
+
           if [ "$TARGET_ENV" = "dev" ]; then
-            echo "Simulating PR for dev deployment"
+            echo "Extracting PR for dev"
             if [ "$CURRENT_BRANCH" = "develop" ]; then
-              # Real PR extraction (from merge commit)
+              # Real PR from merge commit
               MERGE_COMMIT=$(git log -1 --pretty=%B 2>/dev/null || echo "")
               if echo "$MERGE_COMMIT" | grep -q "Merge pull request"; then
                 PR_NUM=$(echo "$MERGE_COMMIT" | grep -o "Merge pull request #[0-9]*" | grep -o "[0-9]*" | head -1)
@@ -45,60 +41,51 @@ jobs:
                   PR_DATA=$(curl -s -H "Authorization: token $GH_TOKEN" \
                     "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM")
                   PR_TITLE=$(echo "$PR_DATA" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "Untitled PR")
-                  PR_BODY=$(python3 -c "import json, sys; data = json.load(sys.stdin); body = data.get('body', '') or ''; body = body.replace('\n', ' ').replace('\r', '')[:200] + ('...' if len(body) > 200 else '') if body and body != 'null' else ''; print(body)" <<< "$PR_DATA" 2>/dev/null || echo "No description provided.")
-                  if [ -n "$PR_TITLE" ]; then
-                    DEPLOYMENT_INFO="*PR #${PR_NUM}:* $PR_TITLE\n*Description:* $PR_BODY"
-                  fi
+                  PR_BODY=$(python3 -c "import json, sys; data = json.load(sys.stdin); body = data.get('body', '') or ''; body = body.replace('\n', ' ').replace('\r', '')[:200] + ('...' if len(body) > 200 else '') if body and body != 'null' else ''; print(body)" <<< "$PR_DATA" 2>/dev/null || echo "No description.")
+                  COMMIT_INFO="• *PR #${PR_NUM}:* ${PR_TITLE}\n• *Description:* ${PR_BODY}"
                 fi
               fi
             else
-              # Fake for test (on main/develop)
-              DEPLOYMENT_INFO="*Test PR #123:* Fix the PR relevant issues\n*Description:* Updated recent data to my file for testing."
+              # Fake for test
+              COMMIT_INFO="• *PR #123:* Fix the PR relevant issues\n• *Description:* Updated recent data to my file for testing."
             fi
-          fi
-          
-          # For production/staging: Get from CHANGELOG.md
-          if [ "$TARGET_ENV" = "production" ] || [ "$TARGET_ENV" = "staging" ]; then
+          else
+            # Changelog for stage/prod
             echo "Extracting changelog for $TARGET_ENV"
-            CHANGELOG_PATH="CHANGELOG.md"
-            if [ -f "$CHANGELOG_PATH" ]; then
-              LATEST_CHANGELOG=$(awk '/^## \[[Uu]nreleased/ {flag=1; next} flag && /^### / {gsub(/^### /, "• "); print; next} flag && /^## / {flag=0} flag && /^[ \t]*[-*]/ {gsub(/^[ \t]*[-*] /, "• "); print}' "$CHANGELOG_PATH" | head -20)
-              if [ -n "$LATEST_CHANGELOG" ]; then
-                DEPLOYMENT_INFO="$LATEST_CHANGELOG"
+            if [ -f CHANGELOG.md ]; then
+              LATEST=$(awk '/^## \[[Uu]nreleased/ {flag=1; next} flag && /^### / {gsub(/^### /, "• "); print; next} flag && /^[ \t]*[-*]/ {gsub(/^[ \t]*[-*] /, "• "); print} flag && /^## / {flag=0}' CHANGELOG.md | head -15)
+              if [ -n "$LATEST" ]; then
+                COMMIT_INFO="$LATEST"
               else
-                DEPLOYMENT_INFO="* No unreleased changes in CHANGELOG.md"
+                COMMIT_INFO="• No unreleased changes."
               fi
             else
-              DEPLOYMENT_INFO="* No CHANGELOG.md found - Add one for deploy details! *Test entry:* • Added Slack test workflow."
+              COMMIT_INFO="• *No CHANGELOG.md* - Add one for details.\n• Test entry: Added notification logic."
             fi
           fi
-          
-          if [ -n "$DEPLOYMENT_INFO" ]; then
-            DEPLOYMENT_INFO_ESCAPED=$(echo "$DEPLOYMENT_INFO" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
-            echo "info<<EOF" >> $GITHUB_OUTPUT
-            echo "$DEPLOYMENT_INFO_ESCAPED" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-          else
-            echo "info=No deployment info extracted" >> $GITHUB_OUTPUT
+
+          if [ -z "$COMMIT_INFO" ]; then
+            COMMIT_INFO="• No changes extracted."
           fi
+
+          echo "commits<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMIT_INFO" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Notify Slack - Success
-        if: success()
+      # Send Slack Notification
+      - name: Notify Slack
         env:
-          TARGET_ENVIRONMENT: ${{ inputs.environment == 'app.zentium.ai' && 'production' || inputs.environment == 'staging.zentium.ai' && 'staging' || 'dev' }}
-          RUNTIME_ENVIRONMENT: ${{ inputs.environment }}
-          DEPLOYMENT_INFO: ${{ steps.deployment-info.outputs.info }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          COMMITS: ${{ steps.info.outputs.commits }}
+          BRANCH: ${{ steps.info.outputs.branch }}
+          RUN_URL: ${{ steps.info.outputs.run_url }}
         run: |
-          DEPLOYMENT_DATE=$(date '+%d-%b-%Y %H:%M:%S')
-          if [ -n "$DEPLOYMENT_INFO" ] && [ "$DEPLOYMENT_INFO" != "No deployment info extracted" ]; then
-            DEPLOYMENT_SECTION="*What's New:*\n${DEPLOYMENT_INFO}\n\n"
-          else
-            DEPLOYMENT_SECTION=""
-          fi
+          DATE=$(date '+%d-%b-%Y %H:%M:%S')
+          TEXT="*Test Deployment Notification*\n\n*Branch:* ${BRANCH}\n*Commit Info:*\n\n${COMMITS}\n\nTriggered at: ${DATE}\nGitHub Actions: <${RUN_URL}|View Run>"
           curl -X POST -H 'Content-type: application/json' \
-          --data "{
-            \"text\": \"*Web App Deployment Successful!*\n\n*Environment:* ${TARGET_ENVIRONMENT}\n*Runtime:* ${RUNTIME_ENVIRONMENT}\n*Source Branch:* ${{ github.ref_name }}\n\n${DEPLOYMENT_SECTION}Deployed at: ${DEPLOYMENT_DATE}\nGitHub Actions: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>\"
-          }" \
-          ${{ secrets.SLACK_WEBHOOK_URL }}
+            --data "{\"text\": \"$TEXT\"}" \
+            "$SLACK_WEBHOOK"
