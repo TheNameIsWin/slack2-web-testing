@@ -1,51 +1,67 @@
-name: "Slack Deployment Test"
-run-name: "Slack Test - [${{ github.ref_name }}]"
+name: "Slack Deployment Compare"
+run-name: "Slack Compare - [${{ github.ref_name }}]"
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
       - develop
       - staging
-  workflow_dispatch:
 
 jobs:
-  slack-test:
+  notify:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ⭐ EXTRACT ONLY THE LATEST COMMIT MESSAGE
-      - name: Extract Latest Commit
-        id: deployment-info
+      - name: Read previous stored commit
+        id: prev
         run: |
-          LATEST=$(git log -1 --pretty=format:"%s")
-          echo "info<<EOF" >> $GITHUB_OUTPUT
-          echo "$LATEST" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          FILE=".last_deploy.md"
+          if [ -f "$FILE" ]; then
+            PREV=$(cat $FILE)
+          else
+            PREV=""
+          fi
+          echo "prev_commit=$PREV" >> $GITHUB_OUTPUT
 
-      # ⭐ SEND TO SLACK
+      - name: Get latest commit message
+        id: current
+        run: |
+          CURRENT=$(git log -1 --pretty=format:"%H - %s")
+          echo "$CURRENT" > .last_deploy.md
+          echo "current_commit=$CURRENT" >> $GITHUB_OUTPUT
+
+      - name: Compare commits
+        id: compare
+        run: |
+          if [ "${{ steps.prev.outputs.prev_commit }}" = "${{ steps.current.outputs.current_commit }}" ]; then
+            echo "changed=no" >> $GITHUB_OUTPUT
+          else
+            echo "changed=yes" >> $GITHUB_OUTPUT
+          fi
+
       - name: Notify Slack
+        if: steps.compare.outputs.changed == 'yes'
         env:
           SLACK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          INFO="${{ steps.deployment-info.outputs.info }}"
+          INFO="${{ steps.current.outputs.current_commit }}"
           DATE=$(date '+%d-%b-%Y %H:%M:%S')
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          PAYLOAD=$(jq -n \
-            --arg branch "${{ github.ref_name }}" \
-            --arg info "$INFO" \
-            --arg date "$DATE" \
-            --arg run_url "$RUN_URL" \
-            '{
-              text: "*Test Deployment Notification*\n*Branch:* \($branch)\n\n*Latest Commit:*\n```\n\($info)\n```\nTriggered at: \($date)\nGitHub Actions: <\($run_url)|View Run>"
-            }')
+          TEXT="*New Deployment Detected*\n\n*Latest Commit:*\n\`\`\`\n$INFO\n\`\`\`\nTime: $DATE"
 
-          curl -X POST -H "Content-type: application/json" \
-            --data "$PAYLOAD" \
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \"$TEXT\"}" \
             "$SLACK_URL"
+
+      - name: Commit updated latest deploy file
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          file_pattern: ".last_deploy.md"
+          commit_message: "update latest deploy commit"
