@@ -19,53 +19,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Extract Deployment Info
+      # ⭐ EXTRACT ONLY THE LATEST COMMIT MESSAGE
+      - name: Extract Latest Commit
         id: deployment-info
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git fetch --all --tags --prune
-          CURRENT_BRANCH="${{ github.ref_name }}"
-          DEPLOYMENT_INFO=""
+          LATEST=$(git log -1 --pretty=format:"%s")
+          echo "info<<EOF" >> $GITHUB_OUTPUT
+          echo "$LATEST" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
-          if [ "$CURRENT_BRANCH" = "develop" ]; then
-            MERGE_COMMIT=$(git log -1 --pretty=%B)
-
-            if echo "$MERGE_COMMIT" | grep -q "Merge pull request"; then
-              PR_NUM=$(echo "$MERGE_COMMIT" | grep -o "Merge pull request #[0-9]*" | grep -o "[0-9]*")
-
-              if [ -n "$PR_NUM" ]; then
-                PR_TITLE=$(curl -s -H "Authorization: token $GH_TOKEN" \
-                  "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM" \
-                  | jq -r '.title // empty')
-
-                [ -n "$PR_TITLE" ] && DEPLOYMENT_INFO="PR #$PR_NUM: $PR_TITLE"
-              fi
-            fi
-          fi
-
-          if [ "$CURRENT_BRANCH" = "staging" ]; then
-            if git rev-parse --verify origin/develop >/dev/null 2>&1; then
-              COMMITS=$(git log origin/develop..HEAD --oneline --no-merges -5)
-              [ -z "$COMMITS" ] && COMMITS=$(git log origin/develop --oneline --no-merges -5)
-              DEPLOYMENT_INFO=$(echo "$COMMITS" | sed 's/^/• /')
-            fi
-          fi
-
-          if [ "$CURRENT_BRANCH" = "main" ]; then
-            COMMITS=$(git log --oneline -5)
-            DEPLOYMENT_INFO=$(echo "$COMMITS" | sed 's/^/• /')
-          fi
-
-          if [ -z "$DEPLOYMENT_INFO" ]; then
-            COMMITS=$(git log --oneline -3)
-            DEPLOYMENT_INFO=$(echo "$COMMITS" | sed 's/^/• /')
-          fi
-
-          echo "info<<__END__" >> $GITHUB_OUTPUT
-          echo "$DEPLOYMENT_INFO" >> $GITHUB_OUTPUT
-          echo "__END__" >> $GITHUB_OUTPUT
-
+      # ⭐ SEND TO SLACK
       - name: Notify Slack
         env:
           SLACK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -80,9 +43,9 @@ jobs:
             --arg date "$DATE" \
             --arg run_url "$RUN_URL" \
             '{
-              text: "*Test Deployment Notification*\n*Branch:* \($branch)\n*Commit Info:*\n```\n\($info)\n```\nTriggered at: \($date)\nGitHub Actions: <\($run_url)|View Run>"
+              text: "*Test Deployment Notification*\n*Branch:* \($branch)\n\n*Latest Commit:*\n```\n\($info)\n```\nTriggered at: \($date)\nGitHub Actions: <\($run_url)|View Run>"
             }')
 
-          curl -X POST -H "Content-type:application/json" \
+          curl -X POST -H "Content-type: application/json" \
             --data "$PAYLOAD" \
             "$SLACK_URL"
