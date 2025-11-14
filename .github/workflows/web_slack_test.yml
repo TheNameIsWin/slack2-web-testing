@@ -16,35 +16,51 @@ on:
 jobs:
   notify:
     runs-on: ubuntu-latest
+
     steps:
+
+      # ---------------------------------------------------
+      # Checkout full history (IMPORTANT for git log)
+      # ---------------------------------------------------
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # important for git log comparison
+          fetch-depth: 0
 
-      # STEP 1: OLD & NEW SHA GET KARO (YOU ALREADY USE YOUR OWN SOURCE)
-      - name: Get old and new SHA
+      # ---------------------------------------------------
+      # STEP 1: SAFE OLD & NEW SHA DETECTION
+      # ---------------------------------------------------
+      - name: Get old and new SHA (Safe)
         id: sha
         run: |
-          # OLD SHA: Directly from last successful run (example)
-          # You can replace this with your own stored SHA
-          OLD_SHA=$(git rev-parse HEAD~5)
+          TOTAL=$(git rev-list --count HEAD)
 
-          # NEW SHA: always HEAD
+          # If at least 2 commits exist
+          if [ "$TOTAL" -gt 1 ]; then
+            OLD_SHA=$(git rev-parse HEAD~1)
+          else
+            # Only one commit → fallback
+            OLD_SHA=$(git rev-parse HEAD)
+          fi
+
           NEW_SHA=$(git rev-parse HEAD)
 
           echo "old_sha=$OLD_SHA" >> $GITHUB_OUTPUT
           echo "new_sha=$NEW_SHA" >> $GITHUB_OUTPUT
         shell: bash
 
-      # STEP 2: RECENT COMMITS MD FILE GENERATE
+      # ---------------------------------------------------
+      # STEP 2: Generate markdown containing recent commits
+      # ---------------------------------------------------
       - name: Generate recent commits markdown
         run: |
           git log ${{ steps.sha.outputs.old_sha }}..${{ steps.sha.outputs.new_sha }} \
             --pretty=format:"* %s (%an)" > recent_commits.md
         shell: bash
 
-      # STEP 3: READ MD FILE SAFE OUTPUT
-      - name: Read recent commit MD file
+      # ---------------------------------------------------
+      # STEP 3: Read markdown file and escape it for Slack
+      # ---------------------------------------------------
+      - name: Read recent commit MD file (safe output)
         id: mdfile
         run: |
           CONTENT=$(cat recent_commits.md)
@@ -54,8 +70,9 @@ jobs:
           echo "commits=$CONTENT" >> $GITHUB_OUTPUT
         shell: bash
 
-      # 🔽 YOUR EXISTING CODE STARTS HERE 🔽
-
+      # ---------------------------------------------------
+      # STEP 4: Fetch merged PR (if any)
+      # ---------------------------------------------------
       - name: Fetch Latest Merged PR
         id: fetch-pr
         run: |
@@ -64,6 +81,9 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
         shell: bash
 
+      # ---------------------------------------------------
+      # STEP 5: Extract PR details (type/title/body)
+      # ---------------------------------------------------
       - name: Extract PR Details & Type
         id: pr-details
         if: steps.fetch-pr.outputs.pr_number != '0'
@@ -72,6 +92,8 @@ jobs:
           TITLE=$(gh pr view "$PR_NUMBER" --json title -q '.title')
           BODY=$(gh pr view "$PR_NUMBER" --json body -q '.body // empty')
           BODY_SNIPPET=$(echo "$BODY" | head -c 200)
+
+          # TypeDetection
           if [[ $TITLE == *"feat:"* ]]; then
             TYPE="Feat"
           elif [[ $TITLE == *"fix:"* ]]; then
@@ -79,6 +101,7 @@ jobs:
           else
             TYPE="Other"
           fi
+
           echo "title=$TITLE" >> $GITHUB_OUTPUT
           echo "body_snippet<<EOF" >> $GITHUB_OUTPUT
           echo "$BODY_SNIPPET" >> $GITHUB_OUTPUT
@@ -86,7 +109,9 @@ jobs:
           echo "type=$TYPE" >> $GITHUB_OUTPUT
         shell: bash
 
-      # STEP 4: SEND BOTH PR INFO + COMMIT DIFF → SLACK
+      # ---------------------------------------------------
+      # STEP 6: SLACK NOTIFICATION (PR INFO + COMMITS)
+      # ---------------------------------------------------
       - name: Notify Slack - Success
         if: always()
         env:
@@ -102,11 +127,21 @@ jobs:
           else
             PR_TITLE="No Recent PR"
             PR_TYPE="N/A"
-            PR_SNIPPET="Direct test deploy"
+            PR_SNIPPET="Direct Deployment (No PR merged)"
             PR_LINK="N/A"
           fi
+
           curl -X POST -H 'Content-type: application/json' \
           --data "{
-            \"text\": \"*Deployment Successful!*\n\n*Environment:* $TARGET_ENVIRONMENT\n*Branch:* ${{ github.ref_name }}\n\n*PR Title:* $PR_TITLE\n*Type:* $PR_TYPE\n*PR Description (Snippet):*\n\`\`\`\n$PR_SNIPPET\n\`\`\`\n$PR_LINK\n\n*Recent Commits (Auto-detected):*\n\`\`\`\n${{ steps.mdfile.outputs.commits }}\n\`\`\`\nDeployed at: $DEPLOYMENT_DATE\nGitHub Actions: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>\"
+            \"text\": \"🚀 *Deployment Successful!*\n\n
+            *Environment:* $TARGET_ENVIRONMENT\n
+            *Branch:* ${{ github.ref_name }}\n\n
+            *PR Title:* $PR_TITLE\n
+            *Type:* $PR_TYPE\n
+            *PR Description:*\n\`\`\`\n$PR_SNIPPET\n\`\`\`\n
+            $PR_LINK\n\n
+            *Recent Commits:*\n\`\`\`\n${{ steps.mdfile.outputs.commits }}\n\`\`\`\n
+            *Deployed At:* $DEPLOYMENT_DATE\n
+            GitHub Actions: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>\"
           }" \
           ${{ secrets.SLACK_WEBHOOK_URL }}
