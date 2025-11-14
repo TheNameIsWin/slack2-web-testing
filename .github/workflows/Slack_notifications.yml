@@ -1,55 +1,104 @@
-name: '[Ondemand] Test Web Slack Notification'
-run-name: '[${{ inputs.environment }}] Web Slack Test'
+name: '[Test] Publish Web App to S3 - Slack Notify'
+run-name: '[${{ inputs.environment }}] Test Slack Notification'
 
 on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Environment'
+        description: 'The environment to deploy to'
         required: true
+        type: choice
+        options:
+          - dev.zentium.ai
+          - app.zentium.ai
+          - staging.zentium.ai
         default: 'dev.zentium.ai'
 
 jobs:
-  build:
+  test-notify:
+    name: Test Notification
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/web
-
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # For git log/API
 
-      # 🔥 Step 1: Extract last 5 commit messages
-      - name: Get Deployment Info
-        id: info
+      - name: Extract Deployment Information
+        id: deployment-info
         run: |
-          COMMITS=$(git log -5 --pretty=format:"• %s")
-          echo "COMMITS<<EOF" >> $GITHUB_OUTPUT
-          echo "$COMMITS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          DEPLOYMENT_INFO=""
+          CURRENT_BRANCH="${{ github.ref_name }}"
+          TARGET_ENV="${{ inputs.environment == 'app.zentium.ai' && 'production' || inputs.environment == 'staging.zentium.ai' && 'staging' || 'dev' }}"
+          
+          echo "Current Branch: $CURRENT_BRANCH"
+          echo "Target Environment: $TARGET_ENV"
+          
+          # For dev: Simulate PR details (real API if on develop; fake for test)
+          if [ "$TARGET_ENV" = "dev" ]; then
+            echo "Simulating PR for dev deployment"
+            if [ "$CURRENT_BRANCH" = "develop" ]; then
+              # Real PR extraction (from merge commit)
+              MERGE_COMMIT=$(git log -1 --pretty=%B 2>/dev/null || echo "")
+              if echo "$MERGE_COMMIT" | grep -q "Merge pull request"; then
+                PR_NUM=$(echo "$MERGE_COMMIT" | grep -o "Merge pull request #[0-9]*" | grep -o "[0-9]*" | head -1)
+                if [ -n "$PR_NUM" ]; then
+                  PR_DATA=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                    "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM")
+                  PR_TITLE=$(echo "$PR_DATA" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "Untitled PR")
+                  PR_BODY=$(python3 -c "import json, sys; data = json.load(sys.stdin); body = data.get('body', '') or ''; body = body.replace('\n', ' ').replace('\r', '')[:200] + ('...' if len(body) > 200 else '') if body and body != 'null' else ''; print(body)" <<< "$PR_DATA" 2>/dev/null || echo "No description provided.")
+                  if [ -n "$PR_TITLE" ]; then
+                    DEPLOYMENT_INFO="*PR #${PR_NUM}:* $PR_TITLE\n*Description:* $PR_BODY"
+                  fi
+                fi
+              fi
+            else
+              # Fake for test (on main/develop)
+              DEPLOYMENT_INFO="*Test PR #123:* Fix the PR relevant issues\n*Description:* Updated recent data to my file for testing."
+            fi
+          fi
+          
+          # For production/staging: Get from CHANGELOG.md
+          if [ "$TARGET_ENV" = "production" ] || [ "$TARGET_ENV" = "staging" ]; then
+            echo "Extracting changelog for $TARGET_ENV"
+            CHANGELOG_PATH="CHANGELOG.md"
+            if [ -f "$CHANGELOG_PATH" ]; then
+              LATEST_CHANGELOG=$(awk '/^## \[[Uu]nreleased/ {flag=1; next} flag && /^### / {gsub(/^### /, "• "); print; next} flag && /^## / {flag=0} flag && /^[ \t]*[-*]/ {gsub(/^[ \t]*[-*] /, "• "); print}' "$CHANGELOG_PATH" | head -20)
+              if [ -n "$LATEST_CHANGELOG" ]; then
+                DEPLOYMENT_INFO="$LATEST_CHANGELOG"
+              else
+                DEPLOYMENT_INFO="* No unreleased changes in CHANGELOG.md"
+              fi
+            else
+              DEPLOYMENT_INFO="* No CHANGELOG.md found - Add one for deploy details! *Test entry:* • Added Slack test workflow."
+            fi
+          fi
+          
+          if [ -n "$DEPLOYMENT_INFO" ]; then
+            DEPLOYMENT_INFO_ESCAPED=$(echo "$DEPLOYMENT_INFO" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+            echo "info<<EOF" >> $GITHUB_OUTPUT
+            echo "$DEPLOYMENT_INFO_ESCAPED" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "info=No deployment info extracted" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
 
-      # 🔥 Step 2: Send Slack Notification (Success)
       - name: Notify Slack - Success
         if: success()
         env:
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment == 'app.zentium.ai' && 'production' || inputs.environment == 'staging.zentium.ai' && 'staging' || 'dev' }}
+          RUNTIME_ENVIRONMENT: ${{ inputs.environment }}
+          DEPLOYMENT_INFO: ${{ steps.deployment-info.outputs.info }}
         run: |
-          DATE=$(date '+%d-%b-%Y %H:%M:%S')
+          DEPLOYMENT_DATE=$(date '+%d-%b-%Y %H:%M:%S')
+          if [ -n "$DEPLOYMENT_INFO" ] && [ "$DEPLOYMENT_INFO" != "No deployment info extracted" ]; then
+            DEPLOYMENT_SECTION="*What's New:*\n${DEPLOYMENT_INFO}\n\n"
+          else
+            DEPLOYMENT_SECTION=""
+          fi
           curl -X POST -H 'Content-type: application/json' \
           --data "{
-            \"text\": \"*Web App Deployment Successful!*\n\n*Environment:* ${TARGET_ENVIRONMENT}\n\n*Changes:*\n${{ steps.info.outputs.COMMITS }}\n\nDeployed at: ${DATE}\"
-          }" \
-          ${{ secrets.SLACK_WEBHOOK_URL }}
-
-      # 🔥 Step 3: Slack Notification (Failure)
-      - name: Notify Slack - Failure
-        if: failure()
-        env:
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
-        run: |
-          DATE=$(date '+%d-%b-%Y %H:%M:%S')
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{
-            \"text\": \"*Web App Deployment Failed!*\n\n*Environment:* ${TARGET_ENVIRONMENT}\n\n*Check Logs in GitHub Actions.*\nFailed at: ${DATE}\"
+            \"text\": \"*Web App Deployment Successful!*\n\n*Environment:* ${TARGET_ENVIRONMENT}\n*Runtime:* ${RUNTIME_ENVIRONMENT}\n*Source Branch:* ${{ github.ref_name }}\n\n${DEPLOYMENT_SECTION}Deployed at: ${DEPLOYMENT_DATE}\nGitHub Actions: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>\"
           }" \
           ${{ secrets.SLACK_WEBHOOK_URL }}
